@@ -123,7 +123,43 @@ def interpret_command(user_text: str) -> DroneMotionCommand:
         format=DroneMotionCommand.model_json_schema(),
         options={"temperature": 0, "num_ctx": 4096},
     )
-    return DroneMotionCommand.model_validate_json(response.message.content)
+    command = DroneMotionCommand.model_validate_json(response.message.content)
+
+    text = user_text.lower()
+    mentions_sideways = "sideways" in text or "sideway" in text
+    has_explicit_lateral_direction = (
+        "left" in text
+        or "right" in text
+        or "port" in text
+        or "starboard" in text
+    )
+
+    if (
+        mentions_sideways
+        and not has_explicit_lateral_direction
+        and command.valid
+        and command.lateral_direction != LateralDirection.NONE
+    ):
+        return command.model_copy(
+            update={
+                "valid": False,
+                "longitudinal_direction": LongitudinalDirection.NONE,
+                "longitudinal_speed_mps": 0.0,
+                "lateral_direction": LateralDirection.NONE,
+                "lateral_speed_mps": 0.0,
+                "vertical_direction": VerticalDirection.NONE,
+                "vertical_speed_mps": 0.0,
+                "yaw_direction": YawDirection.NONE,
+                "yaw_speed_deg_s": 0.0,
+                "duration_seconds": None,
+                "reason": (
+                    "Ambiguous lateral motion: specify 'left' or 'right' when using "
+                    "'sideways'."
+                ),
+            }
+        )
+
+    return command
 
 
 def main() -> None:
