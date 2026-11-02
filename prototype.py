@@ -114,6 +114,17 @@ Output: invalid because no numerical forward speed was specified.
 
 
 def interpret_command(user_text: str) -> DroneMotionCommand:
+    # Exact zero-motion requests need no model interpretation. Do not match a
+    # prefix: "hover then move forward" must still go through normal parsing.
+    zero_request = " ".join(user_text.strip().casefold().rstrip(".!").split())
+    if zero_request in {"hover", "stop", "hold", "hold position"}:
+        return DroneMotionCommand(
+            valid=True, reason=None, duration_seconds=None,
+            longitudinal_direction=LongitudinalDirection.NONE, longitudinal_speed_mps=0,
+            lateral_direction=LateralDirection.NONE, lateral_speed_mps=0,
+            vertical_direction=VerticalDirection.NONE, vertical_speed_mps=0,
+            yaw_direction=YawDirection.NONE, yaw_speed_deg_s=0,
+        )
     response = chat(
         model=MODEL_NAME,
         messages=[
@@ -121,8 +132,11 @@ def interpret_command(user_text: str) -> DroneMotionCommand:
             {"role": "user", "content": user_text},
         ],
         format=DroneMotionCommand.model_json_schema(),
-        options={"temperature": 0, "num_ctx": 4096},
+        options={"temperature": 0, "num_ctx": 4096, "num_predict": 256},
+        keep_alive=-1,
     )
+    if getattr(response, "done_reason", None) == "length":
+        raise ValueError("Instruction exceeded its token budget; command rejected")
     command = DroneMotionCommand.model_validate_json(response.message.content)
 
     text = user_text.lower()

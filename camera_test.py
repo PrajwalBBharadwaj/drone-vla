@@ -17,13 +17,17 @@ def describe_image(image_path: str) -> str:
                 "content": (
                     "Describe the important objects, open areas, buildings, "
                     "vegetation, people, vehicles, and possible navigable "
-                    "space visible in this image. Be concise."
+                    "space visible in this image. Use at most 60 words. "
+                    "Prioritize the central forward path and any direct obstacles."
                 ),
                 "images": [str(path)],
             }
         ],
-        options={"temperature": 0, "num_ctx": 4096},
+        options={"temperature": 0, "num_ctx": 4096, "num_predict": 128},
+        keep_alive=-1,
     )
+    if getattr(response, "done_reason", None) == "length":
+        raise ValueError("Scene description exceeded its token budget; command rejected")
     return response.message.content
 
 

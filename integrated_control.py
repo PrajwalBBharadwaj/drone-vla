@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import logging
+import time
 from typing import Optional
 
 from pydantic import ValidationError
@@ -17,6 +19,17 @@ from vision_test import (
     assess_image,
     assess_monocular_depth,
 )
+
+LOGGER = logging.getLogger("drone_vla.planner")
+
+
+def _timed_stage(name, function, *args):
+    started = time.monotonic()
+    LOGGER.info("stage=%s started", name)
+    try:
+        return function(*args)
+    finally:
+        LOGGER.info("stage=%s elapsed=%.2fs", name, time.monotonic() - started)
 
 
 UNCERTAIN_BLOCK_CONFIDENCE_THRESHOLD = 0.9
@@ -269,7 +282,7 @@ def _apply_auto_yaw_from_clearance(
 
 
 def plan_motion(user_text: str, image_path: Optional[str]) -> IntegratedDecision:
-    command = interpret_command(user_text)
+    command = _timed_stage("instruction", interpret_command, user_text)
 
     wants_safety_check = (
         command.valid
@@ -289,8 +302,15 @@ def plan_motion(user_text: str, image_path: Optional[str]) -> IntegratedDecision
         )
 
     requested_command = command
-    scene = assess_image(image_path)
-    depth = assess_monocular_depth(image_path)
+    scene = _timed_stage("vision", assess_image, image_path)
+    depth = _timed_stage("depth", assess_monocular_depth, image_path)
+
+    return apply_scene_safeguards(requested_command, scene, depth)
+
+
+def apply_scene_safeguards(requested_command, scene, depth):
+    """Shared one-shot safeguards for the legacy and single-pass planners."""
+    command = requested_command
 
     safety_reasons = []
 

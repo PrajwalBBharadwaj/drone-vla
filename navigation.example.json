@@ -1,0 +1,19 @@
+{
+  "image_width": 1920,
+  "image_height": 1080,
+  "fx": null,
+  "fy": null,
+  "cx": null,
+  "cy": null,
+  "camera_forward_aligned": false,
+  "vehicle_radius_m": null,
+  "braking_deceleration_mps2": null,
+  "max_speed_mps": 0.5,
+  "max_yaw_deg_s": 15,
+  "step_seconds": 0.2,
+  "clearance_margin_m": 0.5,
+  "minimum_clearance_m": 3,
+  "standoff_m": 5,
+  "depth_scale": 0.65,
+  "max_processing_seconds": 0.35
+}

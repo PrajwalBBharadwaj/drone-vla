@@ -1,6 +1,7 @@
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+import os
 
 import numpy as np
 from ollama import chat
@@ -72,6 +73,7 @@ Rules:
    enough information about the navigable path to decide.
 8. Confidence must be between 0 and 1.
 9. This is an offline semantic assessment, not a flight-safety decision.
+10. Keep each description and explanation to one brief sentence.
 """
 
 
@@ -123,17 +125,23 @@ def _get_depth_pipeline():
             "environment to enable monocular depth estimation."
         )
 
-    _DEPTH_PIPELINE = pipeline("depth-estimation", model=DEPTH_MODEL_NAME)
+    options = {}
+    if os.environ.get("VLA_DEPTH_DEVICE"):
+        options["device"] = os.environ["VLA_DEPTH_DEVICE"]
+    _DEPTH_PIPELINE = pipeline("depth-estimation", model=DEPTH_MODEL_NAME, **options)
     return _DEPTH_PIPELINE
 
 
-def assess_monocular_depth(image_path: str) -> MonocularDepthAssessment:
-    path = Path(image_path).expanduser().resolve()
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {path}")
-
+def assess_monocular_depth(image_path) -> MonocularDepthAssessment:
+    if isinstance(image_path, Image.Image):
+        image = image_path.convert("RGB")
+    else:
+        path = Path(image_path).expanduser().resolve()
+        if not path.exists():
+            raise FileNotFoundError(f"Image not found: {path}")
+        with Image.open(path) as source:
+            image = source.convert("RGB")
     depth_pipeline = _get_depth_pipeline()
-    image = Image.open(path).convert("RGB")
     output = depth_pipeline(image)
 
     predicted_depth = output.get("predicted_depth")
@@ -199,8 +207,11 @@ def assess_image(image_path: str) -> VisualSceneAssessment:
             },
         ],
         format=VisualSceneAssessment.model_json_schema(),
-        options={"temperature": 0, "num_ctx": 4096},
+        options={"temperature": 0, "num_ctx": 4096, "num_predict": 256},
+        keep_alive=-1,
     )
+    if getattr(response, "done_reason", None) == "length":
+        raise ValueError("Scene assessment exceeded its token budget; command rejected")
     scene = VisualSceneAssessment.model_validate_json(response.message.content)
 
     if _should_downgrade_blocked_to_uncertain(description, scene):

@@ -1,0 +1,8 @@
+ollama==0.6.2
+pydantic==2.13.4
+numpy==1.26.4
+Pillow==11.3.0
+transformers==4.57.6
+torch==2.8.0
+torchvision==0.23.0
+opencv-python-headless==4.11.0.86
