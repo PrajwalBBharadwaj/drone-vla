@@ -85,6 +85,8 @@ def correlate_response(response, metadata, now_ns=None):
     if age < -FUTURE_TOLERANCE_SECONDS or age > MAX_FRAME_AGE_SECONDS:
         navigation["state"], navigation["reason"] = "stale", "Supporting camera frame exceeded the native freshness limit"
         state = "stale"
+        if isinstance(navigation.get("target"), dict):
+            navigation["target"]["fresh"] = False
     if state in HOLD_STATES:
         response["command"] = dict(forward=0.0, right=0.0, up=0.0, yaw=0.0,
                                    duration_seconds=command["duration_seconds"])

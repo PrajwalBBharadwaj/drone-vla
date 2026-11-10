@@ -15,7 +15,7 @@ from unittest.mock import patch
 import numpy as np
 
 from dji_control import DjiClient
-from navigation import NavigationEngine
+from navigation import NavigationEngine, simulation_forward_stop_config
 from navigation_perception import GroundedTarget
 from navigation_control import run_navigation
 from test_navigation import BOX, configuration
@@ -99,9 +99,9 @@ class Harness:
     def status(self):
         return self.client.request({"op": "status"})
 
-    def submit(self):
+    def submit(self, text="Approach the blue building"):
         before = self.client.status()
-        return self.client.request(dict(op="navigate", text="Approach the blue building", goal_id="integration-goal",
+        return self.client.request(dict(op="navigate", text=text, goal_id="integration-goal",
                                         max_seconds=10, interval_seconds=0.1, duration_seconds=0.35,
                                         session=before["session"], ticket=before["ticket"]))
 
@@ -117,9 +117,12 @@ def wait_until(predicate, timeout=3):
 
 
 @contextmanager
-def harness():
+def harness(native_sim_speed=False, sim_profile=False, sim_output_speed=None):
     grounder, depth = PendingGrounding(), Depth()
-    engine = NavigationEngine(configuration(image_width=2, image_height=1, fx=1.4, fy=1.4, cx=1, cy=0.5),
+    config = configuration(image_width=2, image_height=1, fx=1.4, fy=1.4, cx=1, cy=0.5)
+    if sim_profile:
+        config = simulation_forward_stop_config(config, sim_output_speed)
+    engine = NavigationEngine(config,
                               grounder=lambda *_: None, depth=depth, tracker_factory=Tracker, executor=grounder)
     recording = RecordingEngine(engine)
     with tempfile.TemporaryDirectory(prefix="vla-http-", dir="/tmp") as directory, \
@@ -128,7 +131,8 @@ def harness():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         socket_path = str(Path(directory)/"control.sock")
-        process = subprocess.Popen([str(native_binary()), "--integration", f"http://127.0.0.1:{server.server_port}/plan", socket_path],
+        mode = "--high-speed-integration" if native_sim_speed else "--integration"
+        process = subprocess.Popen([str(native_binary()), mode, f"http://127.0.0.1:{server.server_port}/plan", socket_path],
                                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True, bufsize=1)
         instance = Harness(process, DjiClient(socket_path), grounder, depth, recording)

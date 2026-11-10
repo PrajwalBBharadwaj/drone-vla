@@ -14,9 +14,12 @@ import time
 
 from dji_control import joystick_command
 from bridge_protocol import correlate_response, validate_context
+from target_overlay import OverlayState
+from navigation_logging import compact_navigation_line
 
 MAX_BODY_BYTES = 4 + 8192 + 4096 * 2160 * 3
 LOGGER = logging.getLogger("drone_vla.http")
+NAVIGATION_LOGGER = logging.getLogger("drone_vla.navigation")
 
 
 def decode_request(body):
@@ -47,10 +50,10 @@ def decode_request(body):
     return metadata, rgb
 
 
-def plan_request(body, planner=None, commands_only=False, navigation=None):
+def plan_request(body, planner=None, commands_only=False, navigation=None, overlay_state=None):
     received = time.monotonic()
     metadata, rgb = decode_request(body)
-    LOGGER.info("request=%s camera=%sx%s received", metadata["request_id"], metadata["width"], metadata["height"])
+    LOGGER.debug("request=%s camera=%sx%s received", metadata["request_id"], metadata["width"], metadata["height"])
     if metadata["text"].startswith("@nav1:"):
         if commands_only:
             raise ValueError("Navigation requires visual checks; disable commands-only mode")
@@ -58,10 +61,18 @@ def plan_request(body, planner=None, commands_only=False, navigation=None):
             raise ValueError("Navigation is not configured; set --navigation-config with calibrated camera geometry")
         from PIL import Image
         result = navigation.handle(metadata, Image.frombytes("RGB", (metadata["width"], metadata["height"]), rgb), received_at=received)
-        return correlate_response(result, metadata) if metadata.get("bridge_protocol") == 2 else result
+        if metadata.get("bridge_protocol") == 2:
+            result = correlate_response(result, metadata)
+        if overlay_state is not None:
+            overlay_state.update(result)
+        info = result.get("navigation", {})
+        NAVIGATION_LOGGER.info("%s", compact_navigation_line(dict(info, command=result.get("command"))))
+        return result
     if navigation is not None:
         # Ordinary instructions, including Hover, retire a persistent goal.
         navigation.cancel()
+    if overlay_state is not None:
+        overlay_state.clear()
     if planner is None:
         from integrated_control import plan_motion
         planner = plan_motion
@@ -96,19 +107,32 @@ class VlaServer(ThreadingHTTPServer):
         self.commands_only = commands_only
         self.navigation = navigation
         self.inference_lock = threading.Lock()
+        self.overlay_state = OverlayState()
 
 
 class VlaHandler(BaseHTTPRequestHandler):
+    # Full-HD RGB uploads exceed libcurl's automatic Expect: 100-continue
+    # threshold. HTTP/1.1 enables the inherited interim acknowledgement;
+    # HTTP/1.0 makes deployed clients wait a second before sending the frame.
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, message, *args):
+        LOGGER.debug("%s %s", self.address_string(), message % args)
+
     def setup(self):
         super().setup()
         self.connection.settimeout(5)
 
     def reply(self, status, payload):
         data = json.dumps(payload, allow_nan=False).encode()
+        # An early rejection (for example, busy inference) may leave its image
+        # body unread. Never interpret those remaining pixels as another request.
+        self.close_connection = True
         try:
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("Connection", "close")
             self.end_headers()
             self.wfile.write(data)
         except (BrokenPipeError, ConnectionResetError, TimeoutError):
@@ -116,12 +140,24 @@ class VlaHandler(BaseHTTPRequestHandler):
             self.close_connection = True
 
     def do_GET(self):
+        if self.path == "/overlay":
+            self.reply(200, self.server.overlay_state.current())
+            return
         if self.path == "/health":
             health = {"ok": True, "mode": "commands-only" if self.server.commands_only else "vision"}
             if getattr(self.server, "navigation", None) is not None:
                 health["navigation"] = "enabled"
                 health["bridge_protocol"] = 2
                 health["continuous_navigation"] = True
+                config = getattr(self.server.navigation, "config", None)
+                health["navigation_behavior"] = "approach"
+                health["target_overlay"] = "http-v1"
+                health["sim_forward_stop_test_enabled"] = getattr(config, "sim_forward_stop_test", False)
+                if getattr(config, "sim_forward_stop_test", False):
+                    health["directional_behavior"] = "sim-forward-stop-test"
+                    health["sim_forward_speed_mps"] = (
+                        config.sim_forward_speed_mps if config.sim_forward_speed_mps is not None else config.max_speed_mps)
+                    health["planning_speed_mps"] = config.max_speed_mps
             self.reply(200, health)
         else:
             self.reply(404, {"ok": False, "error": "Unknown endpoint"})
@@ -142,15 +178,20 @@ class VlaHandler(BaseHTTPRequestHandler):
             if len(body) != length:
                 raise ValueError("Truncated camera request")
             self.reply(200, plan_request(body, self.server.planner, self.server.commands_only,
-                                         getattr(self.server, "navigation", None)))
+                                         getattr(self.server, "navigation", None),
+                                         getattr(self.server, "overlay_state", None)))
         except (ValueError, KeyError, TypeError, UnicodeError) as error:
+            if getattr(self.server, "overlay_state", None) is not None:
+                self.server.overlay_state.clear()
             LOGGER.warning("Request rejected: %s", error)
             self.reply(400, {"ok": False, "error": str(error)})
         except Exception as error:
+            if getattr(self.server, "overlay_state", None) is not None:
+                self.server.overlay_state.clear()
             LOGGER.exception("Inference failed")
             self.reply(500, {"ok": False, "error": str(error)})
         finally:
-            LOGGER.info("POST /plan elapsed=%.2fs", time.monotonic() - started)
+            LOGGER.debug("POST /plan elapsed=%.2fs", time.monotonic() - started)
             self.server.inference_lock.release()
 
 
@@ -159,18 +200,43 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8766)
+    parser.add_argument("--log-level", choices=("DEBUG", "INFO", "WARNING", "ERROR"),
+                        default=os.environ.get("VLA_LOG_LEVEL", "INFO").upper(),
+                        help="Use DEBUG for full bridge/request traces; also set VLA_LOG_LEVEL=DEBUG")
     parser.add_argument("--preload", action="store_true", help="Load depth weights before accepting requests")
     parser.add_argument("--commands-only", action="store_true", default=os.environ.get("VLA_COMMANDS_ONLY") == "1",
                         help="Parse instructions without image/depth assessment; also set VLA_COMMANDS_ONLY=1")
     parser.add_argument("--navigation-config", default=os.environ.get("VLA_NAVIGATION_CONFIG"),
                         help="Enable persistent goal navigation with calibrated camera/controller JSON")
+    parser.add_argument("--sim-forward-stop-test", action="store_true",
+                        default=os.environ.get("VLA_SIM_FORWARD_STOP_TEST") == "1",
+                        help="Hybrid-HITL diagnostic for literal forward instructions; object goals still track and steer")
+    parser.add_argument("--sim-forward-speed-mps", type=float, default=os.environ.get("VLA_SIM_FORWARD_SPEED_MPS"),
+                        help="Optional HITL forward setpoint in (0,2] m/s; requires --sim-forward-stop-test")
     parser.add_argument("--planner", choices=("legacy", "single-pass"), default="legacy",
                         help="One-shot planner; persistent navigate requests use the separate goal loop")
     args = parser.parse_args()
+    if args.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+        parser.error("--log-level / VLA_LOG_LEVEL must be DEBUG, INFO, WARNING or ERROR")
+    logging.getLogger("drone_vla").setLevel(getattr(logging, args.log_level))
+    if args.sim_forward_speed_mps is not None:
+        if not args.sim_forward_stop_test:
+            parser.error("--sim-forward-speed-mps requires --sim-forward-stop-test")
+        if not math.isfinite(args.sim_forward_speed_mps) or not 0 < args.sim_forward_speed_mps <= 2:
+            parser.error("--sim-forward-speed-mps must be finite and in (0,2] m/s; higher speeds require a native DJI change")
+    if args.sim_forward_stop_test and (not args.navigation_config or args.commands_only):
+        parser.error("--sim-forward-stop-test requires --navigation-config and visual checks")
     navigation = None
     if args.navigation_config and not args.commands_only:
-        from navigation import NavigationConfig, NavigationEngine
-        navigation = NavigationEngine(NavigationConfig.model_validate_json(Path(args.navigation_config).read_text()))
+        from navigation import NavigationConfig, NavigationEngine, simulation_forward_stop_config
+        config = NavigationConfig.model_validate_json(Path(args.navigation_config).read_text())
+        if args.sim_forward_stop_test:
+            config = simulation_forward_stop_config(config, args.sim_forward_speed_mps)
+        navigation = NavigationEngine(config)
+        if config.sim_forward_stop_test:
+            output_speed = config.sim_forward_speed_mps if config.sim_forward_speed_mps is not None else config.max_speed_mps
+            LOGGER.warning("SIM FORWARD-STOP TEST available for literal forward instructions: output_speed=%sm/s planning_speed=%sm/s margin=0.2m minimum_clearance=2m; object destinations retain tracking and steering",
+                           output_speed, config.max_speed_mps)
         if args.preload:
             navigation.preload()
     elif args.preload and not args.commands_only:

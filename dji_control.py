@@ -9,6 +9,8 @@ import socket
 import tempfile
 import time
 
+MAX_RESPONSE_BYTES = 65536
+
 
 def joystick_command(command, default_duration=1.0):
     """PSDK body coordinates: forward/right/up positive, clockwise yaw positive."""
@@ -50,11 +52,21 @@ class DjiClient:
         # A private directory prevents other users from replacing the reply socket.
         with tempfile.TemporaryDirectory(prefix="dji-vla-") as directory:
             with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as client:
+                # Target status can exceed the small default Unix datagram
+                # queue on some hosts. Match the protocol's receive capacity.
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, MAX_RESPONSE_BYTES)
                 client.bind(str(Path(directory) / "client.sock"))
                 client.settimeout(self.timeout)
                 client.connect(self.path)
                 client.send(json.dumps(payload, allow_nan=False).encode())
-                response = json.loads(client.recv(4096))
+                # Status includes both structured navigation telemetry and its
+                # serialized override reason. Read one extra byte so an
+                # oversized datagram is rejected rather than silently parsed
+                # as a truncated status response.
+                raw = client.recv(MAX_RESPONSE_BYTES + 1)
+                if len(raw) > MAX_RESPONSE_BYTES:
+                    raise RuntimeError("dji-lte response exceeds the 65536-byte limit")
+                response = json.loads(raw)
         if not response.get("ok"):
             raise RuntimeError(response.get("error", "dji-lte rejected request"))
         return response

@@ -1,5 +1,6 @@
 """Submit one persistent navigation goal; monitor native-owned camera updates."""
 import argparse
+from copy import deepcopy
 import json
 import math
 import os
@@ -10,6 +11,16 @@ import uuid
 
 from dji_control import DjiClient, execute
 from navigation import RESULT_PREFIX, encode_message
+from navigation_logging import compact_navigation_line
+
+
+def _target_snapshot(info, native_state):
+    """A native watchdog can invalidate the last Python observation in place."""
+    target = deepcopy(info.get("target"))
+    invalid = {"stale", "lost", "error", "cancelled"}
+    if isinstance(target, dict) and (info.get("state") in invalid or native_state in invalid):
+        target["fresh"] = False
+    return target
 
 
 class OwnedClient:
@@ -84,6 +95,8 @@ def run_legacy_navigation(client, text, max_seconds=120, interval=0.1, duration=
                           update_interval_ms=None if previous_accepted is None else round((accepted-previous_accepted)*1000, 2),
                           since_goal_ms=round((accepted-started)*1000, 2),
                           service_timings_ms=info.get("timings_ms", {}))
+            if "target" in info:
+                sample["target"] = _target_snapshot(info, status.get("state"))
             previous_accepted = accepted
             samples.append(sample)
             emit(json.dumps(dict(sample, reason=info["reason"], command=status.get("command")), allow_nan=False))
@@ -140,13 +153,20 @@ def run_navigation(client, text, max_seconds=120, interval=0.1, duration=0.35,
                 raise RuntimeError("Native navigation goal does not match this client")
             state = info.get("state")
             command = status.get("command", {})
-            signature = (info.get("sequence"), state, tuple(command.get(key) for key in ("forward", "right", "up", "yaw")))
+            # Target measurements can change while the motion command is held.
+            # Keep those observations in the terminal and exported metrics too.
+            target = _target_snapshot(info, status.get("state"))
+            target_signature = json.dumps(target, sort_keys=True, allow_nan=False)
+            signature = (info.get("sequence"), state, tuple(command.get(key) for key in ("forward", "right", "up", "yaw")),
+                         target_signature)
             if signature != last_signature:
                 sample = dict(sequence=info.get("sequence"), state=state, bridge_protocol=2,
                               status_round_trip_ms=round((received-sent)*1000, 2),
                               since_goal_ms=round((received-started)*1000, 2),
                               service_timings_ms=info.get("timings_ms", {}),
                               command=command, reason=info.get("reason", ""))
+                if "target" in info:
+                    sample["target"] = target
                 samples.append(sample)
                 emit(json.dumps(sample, allow_nan=False))
                 last_signature = signature
@@ -173,12 +193,15 @@ def main():
     parser.add_argument("--interval", type=float, default=0.1)
     parser.add_argument("--duration", type=float, help="Command lease in seconds (continuous default/max 0.35; legacy default 0.2)")
     parser.add_argument("--metrics", type=Path, help="Write JSON timing samples, including on interruption")
+    parser.add_argument("--verbose-json", action="store_true",
+                        help="Print full JSON observations instead of compact command/target lines")
     parser.add_argument("--legacy-steps", action="store_true", help="Explicitly use terminal-driven steps with the old bridge")
     args = parser.parse_args()
     records = []
     def emit(line):
-        print(line, flush=True)
-        records.append(json.loads(line))
+        record = json.loads(line)
+        records.append(record)
+        print(line if args.verbose_json else compact_navigation_line(record), flush=True)
     try:
         runner = run_legacy_navigation if args.legacy_steps else run_navigation
         duration = args.duration if args.duration is not None else (0.2 if args.legacy_steps else 0.35)

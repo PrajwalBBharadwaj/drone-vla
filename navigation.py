@@ -51,6 +51,14 @@ class NavigationConfig(BaseModel):
     max_goal_seconds: float = Field(default=120, gt=0, le=300)
     grounding_timeout_seconds: float = Field(default=60, gt=0, le=120)
     min_grounding_confidence: float = Field(default=0.8, ge=0.7, le=1)
+    yaw_deadband_deg: float = Field(default=3, gt=0, le=10)
+    target_recovery_seconds: float = Field(default=5, gt=0, le=30)
+    # Temporary hybrid-HITL diagnostic: simulated yaw cannot turn the real feed.
+    # Object destinations retain normal tracking and destination steering.
+    sim_forward_stop_test: bool = False
+    # Diagnostic output only; the independent real-camera corridor keeps its
+    # low-speed planning profile. The deployed native bridge accepts <=2 m/s.
+    sim_forward_speed_mps: Optional[float] = Field(default=None, gt=0, le=2, strict=True)
 
     @model_validator(mode="after")
     def geometry(self):
@@ -67,6 +75,33 @@ class NavigationConfig(BaseModel):
             raise ValueError("Live frame dimensions differ from camera calibration")
         height = round(self.processing_width * self.image_height / self.image_width)
         return image.resize((self.processing_width, height), Image.Resampling.BILINEAR)
+
+
+def simulation_forward_stop_config(config, forward_speed_mps=None):
+    """Derive a temporary test profile without changing saved calibration."""
+    output_speed = config.sim_forward_speed_mps if forward_speed_mps is None else forward_speed_mps
+    if output_speed is not None:
+        if (type(output_speed) not in (int, float) or not math.isfinite(output_speed)
+                or not 0 < output_speed <= 2):
+            raise ValueError("Simulation forward speed must be finite and in (0, 2] m/s")
+        output_speed = float(output_speed)
+    return config.model_copy(update=dict(sim_forward_stop_test=True,
+                                         max_speed_mps=min(config.max_speed_mps, 0.2),
+                                         sim_forward_speed_mps=output_speed,
+                                         clearance_margin_m=0.2,
+                                         minimum_clearance_m=2.0))
+
+
+def is_sim_forward_instruction(text):
+    """Recognize only unambiguous forward intents for the hybrid diagnostic."""
+    if not isinstance(text, str):
+        return False
+    normalized = " ".join(text.strip().casefold().rstrip(".!?").split())
+    return normalized in {
+        "forward", "move forward", "go forward", "fly forward",
+        "move straight", "go straight", "fly straight",
+        "move straight ahead", "go straight ahead", "fly straight ahead",
+    }
 
 
 class NavigationMessage(BaseModel):
@@ -99,10 +134,11 @@ def zero_axes(duration):
 
 
 def local_command(config, depth, box, elapsed):
-    """Score observed forward headings using an inflated vehicle and stopping distance.
+    """Visually servo toward the destination; stop for an obstructed forward corridor.
 
-    No backward, lateral or vertical movement into unobserved space. No fallback
-    that crosses a known obstacle. A turn is performed before forward motion.
+    A destination outside the alignment deadband causes an in-place turn. Small
+    bearing errors are corrected during forward approach. There is no blind
+    lateral/backward/vertical motion or automatic detour around an obstruction.
     """
     axes = zero_axes(config.step_seconds)
     h, w = depth.shape
@@ -123,6 +159,23 @@ def local_command(config, depth, box, elapsed):
     lookahead = max(config.minimum_clearance_m,
                     radius + speed*(MAX_FRAME_AGE_SECONDS + elapsed + config.step_seconds + config.max_frame_gap_seconds)
                     + speed*speed/(2*config.braking_deceleration_mps2))
+    if config.sim_forward_stop_test:
+        # This diagnostic follows the real camera's current forward corridor,
+        # rather than the grounded object's bearing or arrival stand-off. It
+        # isolates forward motion/obstacle holds when SDK simulation and video
+        # do not share the same pose. Native motion authority, freshness and
+        # expiry checks still apply; object grounding/tracking are intentionally
+        # absent from this literal-forward diagnostic.
+        rx, ry = fx*radius/lookahead, fy*radius/lookahead
+        if cx-rx < 0 or cx+rx >= w or cy-ry < 0 or cy+ry >= h:
+            return axes, "blocked", "SIM forward-stop: inflated footprint does not fit the camera view"
+        yy, xx = np.mgrid[:h, :w]
+        px, py = (xx-cx)/fx*z, (yy-cy)/fy*z
+        collision = (z <= lookahead+radius) & (abs(px) <= radius) & (abs(py) <= radius)
+        if np.any(collision):
+            return axes, "blocked", "SIM forward-stop: obstacle in the current forward corridor; holding"
+        axes["forward"] = config.sim_forward_speed_mps if config.sim_forward_speed_mps is not None else speed
+        return axes, "approaching", "SIM forward-stop: current corridor clear; destination steering disabled"
     x1, y1, x2, y2 = box
     target = z[max(0, int(y1*h)):min(h, math.ceil(y2*h)),
                max(0, int(x1*w)):min(w, math.ceil(x2*w))]
@@ -138,35 +191,63 @@ def local_command(config, depth, box, elapsed):
     yy, xx = np.mgrid[:h, :w]
     px = (xx-cx)/fx*z
     py = (yy-cy)/fy*z
-    headings = np.radians(np.arange(-25, 26, 5))
-    free = []
-    for heading in headings:
-        # The endpoint footprint must fit in the visible FOV.
-        u = cx + fx*math.tan(heading)
-        rx, ry = fx*radius/lookahead, fy*radius/lookahead
-        if u-rx < 0 or u+rx >= w or cy-ry < 0 or cy+ry >= h:
-            continue
-        along = z*math.cos(heading) + px*math.sin(heading)
-        across = px*math.cos(heading) - z*math.sin(heading)
-        collision = (along > 0) & (along <= lookahead+radius) & (abs(across) <= radius) & (abs(py) <= radius)
-        if not np.any(collision):
-            free.append(float(heading))
-    if not free:
-        return axes, "blocked", "No observed heading passes the stopping-distance check"
-    heading = min(free, key=lambda angle: abs(angle-target_heading) + 0.15*abs(angle))
-    # An in-place turn allows the next camera frame to check the new forward path.
-    # Follow the selected free heading, including straight ahead when the target
-    # bearing is obstructed. Turning straight back toward an obstructed target
-    # would undo the detour on every subsequent frame.
-    error = heading
-    if abs(error) >= math.radians(5):
-        axes["yaw"] = math.copysign(min(config.max_yaw_deg_s, max(5, abs(math.degrees(error))*0.8)), error)
-        return axes, "aligning", "Turning toward an observed free heading"
-    # Never translate on a candidate heading different from the actual nose direction.
-    if 0.0 not in free:
-        return axes, "blocked", "Current forward corridor is blocked"
+    rx, ry = fx*radius/lookahead, fy*radius/lookahead
+    if cx-rx < 0 or cx+rx >= w or cy-ry < 0 or cy+ry >= h:
+        return axes, "blocked", "Inflated forward footprint does not fit the camera view"
+    collision = (z <= lookahead+radius) & (abs(px) <= radius) & (abs(py) <= radius)
+    if np.any(collision):
+        return axes, "blocked", "Immediate obstacle in the forward corridor; holding"
+    bearing_deg = math.degrees(target_heading)
+    axes["yaw"] = float(np.clip(0.8*bearing_deg, -config.max_yaw_deg_s, config.max_yaw_deg_s))
+    if abs(bearing_deg) > config.yaw_deadband_deg:
+        return axes, "aligning", "Turning toward the tracked destination"
     axes["forward"] = speed
-    return axes, "approaching", "Forward corridor passes the local depth check"
+    return axes, "approaching", "Approaching the tracked destination; forward corridor clear"
+
+
+def target_observation(config, instruction, metadata, sequence, box=None, depth=None,
+                       visibility="pending", confidence=None, description=None):
+    """Report the current observation in source pixels and forward-aligned body axes.
+
+    Metric depth is optical-axis Z. Euclidean distance and right/up coordinates
+    are derived from the target-box center ray, not independent range sensing.
+    Missing observations deliberately have no current pixel or distance values.
+    """
+    target = dict(instruction=instruction, visibility=visibility,
+                  image_size_px=[config.image_width, config.image_height],
+                  box_normalized=None, box_px=None, center_px=None, bearing_deg=None,
+                  distance_m=None, forward_distance_m=None, position_body_m=None,
+                  distance_source="monocular_metric_estimate", fresh=False,
+                  observed_sequence=sequence, frame_id=metadata.get("frame_id"),
+                  frame_monotonic_ns=metadata.get("frame_monotonic_ns"),
+                  grounding_confidence=confidence, description=description)
+    if box is None:
+        return target
+    x1, y1, x2, y2 = (float(value) for value in box)
+    if not (0 <= x1 < x2 <= 1 and 0 <= y1 < y2 <= 1):
+        raise ValueError("Tracked destination box must be inside the image")
+    u, v = (x1+x2)*config.image_width/2, (y1+y2)*config.image_height/2
+    right_ray, down_ray = (u-config.cx)/config.fx, (v-config.cy)/config.fy
+    target.update(box_normalized=[x1, y1, x2, y2],
+                  box_px=[round(x1*config.image_width, 2), round(y1*config.image_height, 2),
+                          round(x2*config.image_width, 2), round(y2*config.image_height, 2)],
+                  center_px=[round(u, 2), round(v, 2)],
+                  bearing_deg=round(math.degrees(math.atan(right_ray)), 3), fresh=True)
+    if depth is not None:
+        z = np.asarray(depth)
+        h, w = z.shape
+        expected_h = round(config.processing_width*config.image_height/config.image_width)
+        if (w, h) != (config.processing_width, expected_h):
+            raise ValueError("Depth must be aligned with the processed camera frame")
+        roi = z[max(0, int(y1*h)):min(h, math.ceil(y2*h)),
+                max(0, int(x1*w)):min(w, math.ceil(x2*w))]
+        if roi.size and np.all(np.isfinite(roi)) and np.all(roi > 0):
+            forward = float(np.median(roi))*config.depth_scale
+            right, up = right_ray*forward, -down_ray*forward
+            target.update(distance_m=round(math.sqrt(forward**2+right**2+up**2), 3),
+                          forward_distance_m=round(forward, 3),
+                          position_body_m=dict(forward=round(forward, 3), right=round(right, 3), up=round(up, 3)))
+    return target
 
 
 @dataclass
@@ -182,6 +263,12 @@ class Goal:
     last_frame_time: float = 0
     last_frame_id: int = 0
     last_source_ns: int = 0
+    forward_test: bool = False
+    tracker_ready: bool = False
+    tracking_missing_since: Optional[float] = None
+    target: dict = field(default_factory=dict)
+    grounding_confidence: Optional[float] = None
+    description: Optional[str] = None
 
 
 class NavigationEngine:
@@ -214,7 +301,23 @@ class NavigationEngine:
         timings["service_ms"] = round((self.clock()-started)*1000, 2)
         info = dict(goal_id=message.goal_id, sequence=message.sequence, state=state,
                     reason=reason[:180], timings_ms=timings)
-        LOGGER.info("goal=%s sequence=%d state=%s timings_ms=%s reason=%s",
+        goal = self.goal
+        if goal is not None and (goal.message.goal_id, goal.message.owner) == (message.goal_id, message.owner):
+            if goal.target:
+                info["target"] = dict(goal.target)
+                # A terminal/repeated update must not present a previous frame's
+                # coordinates or range as a current observation.
+                info["target"]["fresh"] = (goal.target.get("observed_sequence") == message.sequence
+                                             and state not in {"stale", "lost", "error"}
+                                             and goal.target.get("fresh", False))
+            if goal.forward_test:
+                # Only literal-forward diagnostics can request the optional
+                # native HITL speed override. Object goals never carry it.
+                info["behavior"] = "sim-forward-stop-test"
+        if info.get("target") is not None:
+            LOGGER.debug("goal=%s sequence=%d target=%s", message.goal_id, message.sequence,
+                        json.dumps(info["target"], separators=(",", ":"), allow_nan=False))
+        LOGGER.debug("goal=%s sequence=%d state=%s timings_ms=%s reason=%s",
                     message.goal_id, message.sequence, state, timings, reason)
         duration = (min(MAX_COMMAND_LEASE_SECONDS, metadata["default_duration"]) if metadata.get("bridge_protocol") == 2
                     else min(self.config.step_seconds, metadata["default_duration"]))
@@ -231,15 +334,26 @@ class NavigationEngine:
         # Preparation is included in the response freshness budget.
         frame = self.config.frame(image)
         if message.op == "start":
+            if self.config.sim_forward_stop_test and is_sim_forward_instruction(message.text):
+                self.cancel()
+                self.goal = Goal(message, started, None, state="ready",
+                                 reason="SIM forward-stop: forward instruction accepted; waiting for next fresh frame",
+                                 last_frame_time=started, last_frame_id=metadata.get("frame_id", 0),
+                                 last_source_ns=metadata.get("frame_monotonic_ns", 0), forward_test=True)
+                # A directional intent has no object to ground or follow. The
+                # initial response holds; a new frame and depth check must pass
+                # before any movement can be returned.
+                return self.response(metadata, message, self.goal.state, self.goal.reason, started)
             if self.pending is not None and not self.pending.done():
                 return self.response(metadata, message, "error", "Previous grounding job is still finishing", started)
             self.cancel()
             self.pending = self.executor.submit(self.grounder, message.text, frame.copy())
-            # Sample grounding history at 5 Hz. Capacity is tied to the deadline
-            # and never silently evicts the original grounding reference frame.
+            # Object destinations always track and steer, even if the optional
+            # literal-forward diagnostic is enabled for other instructions.
             capacity = math.ceil(self.config.grounding_timeout_seconds/0.2)+4
             self.goal = Goal(message, started, self.pending, frames=deque(maxlen=capacity), last_frame_time=started,
                              last_frame_id=metadata.get("frame_id", 0), last_source_ns=metadata.get("frame_monotonic_ns", 0))
+            self.goal.target = target_observation(self.config, message.text, metadata, message.sequence)
             self.goal.frames.append((started, frame))
             return self.response(metadata, message, "grounding", self.goal.reason, started)
         goal = self.goal
@@ -274,10 +388,15 @@ class NavigationEngine:
                     if not goal.future.done():
                         return self.response(metadata, message, "grounding", goal.reason, started)
                     result = GroundedTarget.model_validate(goal.future.result())
+                    LOGGER.debug("goal=%s grounded_target found=%s box=%s confidence=%.3f reason=%s",
+                                message.goal_id, result.found, result.box, result.confidence, result.reason)
                     if not result.found or result.confidence < self.config.min_grounding_confidence:
                         raise ValueError("Destination absent or ambiguous: " + result.reason)
+                    LOGGER.info("Destination selected: %s (confidence=%.2f)", result.reason, result.confidence)
+                    goal.grounding_confidence, goal.description = result.confidence, result.reason
                     goal.tracker = self.tracker_factory()
                     goal.tracker.start(goal.frames.popleft()[1], result.box)
+                    goal.tracker_ready = True
                     goal.state, goal.reason = "acquiring", "Tracking buffered frames; holding"
                 # Drain in bounded batches while continuing to accept current
                 # frames. A long grounding job must not create one large replay
@@ -292,16 +411,43 @@ class NavigationEngine:
                 # Grounding/replay never returns movement based on an aged scene.
                 return self.response(metadata, message, goal.state, goal.reason, started)
             tracking_started = self.clock()
-            box = goal.tracker.update(frame)
-            tracking_ms = (self.clock()-tracking_started)*1000
+            if goal.forward_test:
+                box, tracking_ms = None, 0.0
+            else:
+                if (goal.tracking_missing_since is not None
+                        and started-goal.tracking_missing_since >= self.config.target_recovery_seconds):
+                    goal.state, goal.reason = "lost", "Destination tracking recovery timed out; manual takeover or a new goal is required"
+                    return self.response(metadata, message, goal.state, goal.reason, started)
+                box = goal.tracker.update(frame)
+                tracking_ms = (self.clock()-tracking_started)*1000
+                goal.target = target_observation(self.config, goal.message.text, metadata, message.sequence, box,
+                                                 visibility="visible", confidence=goal.grounding_confidence,
+                                                 description=goal.description)
+                tracking_status = getattr(goal.tracker, "last_status", None)
+                tracking_confidence = getattr(goal.tracker, "confidence", None)
             depth_started = self.clock()
             depth = self.depth(frame)
             depth_ms = (self.clock()-depth_started)*1000
             planning_started = self.clock()
-            planning_config = self.config
+            planning_config = self.config.model_copy(update={"sim_forward_stop_test": goal.forward_test,
+                                                             "sim_forward_speed_mps": self.config.sim_forward_speed_mps if goal.forward_test else None})
             if continuous:
-                planning_config = self.config.model_copy(update={"step_seconds": min(MAX_COMMAND_LEASE_SECONDS, metadata["default_duration"])})
+                planning_config = planning_config.model_copy(update={"step_seconds": min(MAX_COMMAND_LEASE_SECONDS, metadata["default_duration"])})
+            if not goal.forward_test:
+                goal.target = target_observation(self.config, goal.message.text, metadata, message.sequence, box, depth,
+                                                 visibility="visible", confidence=goal.grounding_confidence,
+                                                 description=goal.description)
+                if isinstance(tracking_status, str):
+                    goal.target["tracking_status"] = tracking_status
+                if type(tracking_confidence) in (int, float) and math.isfinite(tracking_confidence):
+                    goal.target["tracking_confidence"] = tracking_confidence
             command, state, reason = local_command(planning_config, np.asarray(depth), box, self.clock()-started)
+            if goal.tracking_missing_since is not None:
+                # Do not actuate on the first match after a tracking outage.
+                # Confirm again in a subsequent fresh frame before approaching.
+                goal.tracking_missing_since = None
+                if state in {"aligning", "approaching"}:
+                    command, state, reason = zero_axes(planning_config.step_seconds), "ready", "Destination recovered; waiting for a fresh confirmation frame"
             elapsed = self.clock()-started
             if elapsed > self.config.max_processing_seconds:
                 # Keep the tracker up to date, but ask for a new frame before motion.
@@ -312,8 +458,22 @@ class NavigationEngine:
                                  tracking_ms=round(tracking_ms, 2), depth_ms=round(depth_ms, 2),
                                  planning_ms=round((self.clock()-planning_started)*1000, 2))
         except TrackingLost as error:
-            LOGGER.warning("Target lost; holding: %s", error)
-            goal.state, goal.reason = "lost", str(error)
+            visibility = getattr(error, "status", "unconfirmed")
+            if visibility not in {"out_of_view", "unconfirmed"}:
+                visibility = "unconfirmed"
+            goal.target = target_observation(self.config, goal.message.text, metadata, message.sequence,
+                                             visibility=visibility, confidence=goal.grounding_confidence,
+                                             description=goal.description)
+            if goal.tracker_ready:
+                goal.frames.clear()
+                if goal.tracking_missing_since is None:
+                    goal.tracking_missing_since = started
+                goal.state = "stale"
+                goal.reason = ("Tracked destination projects outside the camera view; holding for visual recovery" if visibility == "out_of_view"
+                               else "Destination position is uncertain; holding and retrying visual tracking")
+            else:
+                goal.state, goal.reason = "lost", "Destination tracking could not initialize; position unconfirmed"
+            LOGGER.warning("Destination tracking %s; holding: %s", visibility, error)
             return self.response(metadata, message, goal.state, goal.reason, started)
         except Exception as error:
             LOGGER.warning("Goal held after perception/planning failure: %s", error, exc_info=not isinstance(error, ValueError))
